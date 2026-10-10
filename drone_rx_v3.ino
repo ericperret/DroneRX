@@ -1,7 +1,38 @@
 /*
  * ══════════════════════════════════════════════════════════════
- *  AH & EPERRET — DRONE RX V3.5
- *  M5Stack CoreS3 — M5Unified
+ *  Nom      : drone_rx_v3.ino
+ *  Projet   : AH & EPERRET — DRONE RX
+ *  Version  : 3.8
+ *  Date     : 2026-10-10
+ *  Auteur   : E. Perret (eperret@azs.fr)
+ *  Cible    : M5Stack CoreS3 (ESP32-S3) — M5Unified
+ *  Core     : arduino-esp32 3.x (requis)
+ *  Fichiers : drone_rx_v3.ino + drone_page.h (même dossier, seuls .ino/.h du sketch)
+ * ══════════════════════════════════════════════════════════════
+ *
+ *  V3.8 (2026-10-10) :
+ *    - Beacon FR : route TLV 11 sur 2 octets (degrés 0–359),
+ *      TLV 7 hauteur / décollage ajouté
+ *    - ID diffusé (FR TLV 2, ODID Basic ID + Operator ID) :
+ *      partie publique seule (sans « -xxx » secret)
+ *    - Heure du téléphone reçue avec la position ("t", ms Unix) :
+ *      ODID System = s depuis 01/01/2019 UTC,
+ *      ODID Location = 1/10 s depuis le début de l'heure
+ *
+ *  V3.7 (2026-10-10) :
+ *    - Écran portail : toucher = passer aux modes même sans client
+ *      (vers QUICK START si la page a été servie)
+ *    - DNS : NSCOUNT/ARCOUNT = 0 (EDNS de la requête supprimé),
+ *      réponse vide (NODATA) aux requêtes autres que A/IN,
+ *      requête malformée ignorée, flag RD recopié
+ *
+ *  V3.6 (2026-10-10) :
+ *    - Notifications BLE découpées à MTU-3 (trames ODID/DJI complètes)
+ *    - Tampon BLE 1024 o : aucun message tronqué (message trop long = rejeté)
+ *    - Écran transport redessiné par loop() via drapeau
+ *      (plus aucun dessin depuis la tâche BLE)
+ *    - Transport remis à jour à la déconnexion BLE
+ *    - Affichage transport : BLE connecté / AP WiFi / BLE en attente
  *
  *  V3.5 :
  *    - USB data → BLE (Web Bluetooth), Serial debug conservé
@@ -12,16 +43,17 @@
  *
  *  Architecture :
  *    WiFi AP  = page HTML (drone.local), pas de scan
- *    BLE      = données drone bidirectionnel, scan 100% entre bursts
+ *    BLE      = données drone bidirectionnel, envoi en rafale entre canaux
  *
  *  Protocoles (4) : FR / ODID / DJI / PAR
  *  Beep mélodique uniquement sur nouveau drone.
  *
- *  Board  : ESP32S3 Dev Module
- *  Lib    : M5Unified, ESPmDNS, BLE (built-in)
- *  USB CDC: Enabled / PSRAM: OPI / Flash: 16MB QIO
- *
- *  Fichiers : drone_rx_v3.ino + drone_page.h (même dossier)
+ *  Board     : ESP32S3 Dev Module
+ *  Lib       : M5Unified, ESPmDNS, BLE (built-in)
+ *  USB CDC   : Enabled / PSRAM: OPI / Flash: 16MB QIO
+ *  Partition : 16M Flash (3MB APP/9.9MB FATFS) — OBLIGATOIRE
+ *              (binaire ~1,5 Mo > 1,2 Mo du schéma par défaut)
+ *  Compilé   : arduino-esp32 3.3.12 + M5Unified 0.2.25
  * ══════════════════════════════════════════════════════════════
  */
 
@@ -72,7 +104,10 @@
 #define BLE_TX_CHAR_UUID  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"   // notify → phone
 #define BLE_RX_CHAR_UUID  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"   // write ← phone
 #define BLE_QUEUE_SIZE    8
-#define BLE_MSG_SIZE      300
+#define BLE_MSG_SIZE      1024    // ── V3.6 : > jsonBuffer max (928) + '\n' ──
+#define BLE_MTU_LOCAL     247     // MTU max demandé côté ESP32
+#define BLE_MTU_MIN       23      // MTU par défaut BLE
+#define BLE_NOTIFY_GAP_MS 3       // pause entre 2 notifications
 #define BLE_IDLE_SLEEP_MS 300000  // 5 min sans BLE → écran veille
 
 
@@ -234,8 +269,11 @@ enum Transport {
   XPORT_WIFI
 };
 
-Transport activeTransport = XPORT_NONE;
+volatile Transport activeTransport = XPORT_NONE;
 bool wifiAPActive = false;
+
+// ── V3.6 : demande de redessin transport (posée par la tâche BLE) ──
+volatile bool transportDirty = false;
 
 
 // ══════════════════════════════════════════════════════════════
@@ -280,7 +318,7 @@ uint32_t portalPageSize = 0;
 //    Y 56–68  : Dernier événement
 //    Y 69     : Labels canaux (1–14)
 //    Y 80–199 : Zone waterfall (120 lignes × 14 colonnes)
-//    Y 200–213: Boutons touch [PWR OFF] [MODE]
+//    Y 200–213: Boutons touch [PWR OFF] [REBOOT] [MODE]
 //    Y 214–225: (espace)
 //    Y 226–240: Barre info (CH, Total, Transport, Batterie)
 //
@@ -487,7 +525,7 @@ void handleDHCP() {
     Serial.printf("[DHCP] ACK → 192.168.4.%d  \"%s\"\n",
       dhcpClients[idx].ipLast, getDHCPClientName(idx));
 
-    // CORRECTION Gemini : On affiche l'IP ET on récupère le hostname mémorisé
+    // On affiche l'IP ET on récupère le hostname mémorisé
     snprintf(portalClientIP, sizeof(portalClientIP), "192.168.4.%d (%s)",
       dhcpClients[idx].ipLast, getDHCPClientName(idx));
     if (portalStep < PORTAL_CLIENT) {
@@ -558,6 +596,29 @@ uint16_t  beaconLen         = 0;
 uint32_t  txCount           = 0;
 uint16_t  txSeqNum          = 0;
 uint32_t  lastTxBeacon      = 0;
+
+// ── V3.8 : heure du téléphone (ms Unix) recalée sur millis() ──
+portMUX_TYPE timeMux       = portMUX_INITIALIZER_UNLOCKED;
+int64_t      phoneMsOffset = 0;   // ms Unix téléphone - millis()
+
+void setPhoneTime(uint64_t unixMs) {
+  int64_t off = (int64_t)unixMs - (int64_t)millis();
+  taskENTER_CRITICAL(&timeMux);
+  phoneMsOffset = off;
+  taskEXIT_CRITICAL(&timeMux);
+}
+
+uint64_t nowUnixMs() {
+  taskENTER_CRITICAL(&timeMux);
+  int64_t off = phoneMsOffset;
+  taskEXIT_CRITICAL(&timeMux);
+  return (uint64_t)((int64_t)millis() + off);
+}
+
+// ── V3.8 : longueur de la partie publique de l'ID (avant le « - » secret) ──
+uint8_t publicIdLen(const char* id) {
+  return (uint8_t)strcspn(id, "-");
+}
 
 #define KB_MAX_LEN 20
 char      kbInput[KB_MAX_LEN + 1] = "";
@@ -652,6 +713,9 @@ void checkSerialInput() {
               }
             }
           }
+          // ── V3.8 : heure téléphone (ms Unix) ──
+          char* tt = strstr(serialInBuf, "\"t\":");
+          if (tt) setPhoneTime(strtoull(tt + 4, NULL, 10));
           // ── V3.4 : son on/off depuis HTML ──
           char* sp = strstr(serialInBuf, "\"snd\":");
           if (sp) {
@@ -817,32 +881,42 @@ void handleDNS() {
   int len = dnsServer.read(buf, sizeof(buf));
   if (len < 12) return;
 
-  // Flags : QR=1, AA=1, RCODE=0
-  buf[2] = 0x85;
-  buf[3] = 0x80;
-  // ANCOUNT = 1
-  buf[6] = 0x00;
-  buf[7] = 0x01;
+  // ── V3.7 : requête standard uniquement (QR=0, OPCODE=0), 1 question ──
+  if ((buf[2] & 0x80) || ((buf[2] >> 3) & 0x0F) != 0) return;
+  if (buf[4] != 0 || buf[5] != 1) return;
 
-  // ── V3.4 : extraire le hostname du QNAME pour l'écran portal ──
-  int qpos = 12;
+  // ── QNAME : contrôle des labels + hostname pour l'écran portal ──
+  int pos = 12;
   char hostname[40] = "";
   int hlen = 0;
-  while (qpos < len && buf[qpos] != 0 && hlen < 38) {
-    uint8_t lbl = buf[qpos++];
-    if (hlen > 0) hostname[hlen++] = '.';
-    for (uint8_t j = 0; j < lbl && qpos < len && hlen < 38; j++)
-      hostname[hlen++] = (char)buf[qpos++];
+  while (pos < len && buf[pos] != 0) {
+    uint8_t lbl = buf[pos];
+    if (lbl > 63 || pos + 1 + lbl >= len) return;   // label invalide/compressé
+    pos++;
+    if (hlen > 0 && hlen < 38) hostname[hlen++] = '.';
+    for (uint8_t j = 0; j < lbl; j++) {
+      if (hlen < 38) hostname[hlen++] = (char)buf[pos];
+      pos++;
+    }
   }
   hostname[hlen] = '\0';
+  if (pos + 5 > len) return;                 // nul + QTYPE(2) + QCLASS(2)
+  pos++;                                     // octet nul fin de QNAME
+  uint16_t qtype  = ((uint16_t)buf[pos]     << 8) | buf[pos + 1];
+  uint16_t qclass = ((uint16_t)buf[pos + 2] << 8) | buf[pos + 3];
+  pos += 4;                                  // fin de la section question
+  bool answerA = (qtype == 1 && qclass == 1);
 
-  // Skipper le QNAME (re-parcourir depuis 12)
-  int pos = 12;
-  while (pos < len && buf[pos] != 0) pos += buf[pos] + 1;
-  pos += 5;  // null + QTYPE(2) + QCLASS(2)
+  // ── En-tête réponse ──
+  buf[2]  = 0x84 | (buf[2] & 0x01);          // QR=1, AA=1, RD recopié
+  buf[3]  = 0x80;                            // RA=1, RCODE=0
+  buf[6]  = 0x00; buf[7]  = answerA ? 1 : 0; // ANCOUNT
+  buf[8]  = 0x00; buf[9]  = 0x00;            // NSCOUNT
+  buf[10] = 0x00; buf[11] = 0x00;            // ARCOUNT (EDNS retiré)
 
-  // Réponse : pointer QNAME (0xC00C), A record, TTL 0, IP 192.168.4.1
-  if (pos + 16 <= (int)sizeof(buf)) {
+  // ── Réponse A : pointeur QNAME (0xC00C), TTL 0, 192.168.4.1 ──
+  if (answerA) {
+    if (pos + 16 > (int)sizeof(buf)) return;
     buf[pos++] = 0xC0; buf[pos++] = 0x0C;  // name pointer
     buf[pos++] = 0x00; buf[pos++] = 0x01;  // TYPE A
     buf[pos++] = 0x00; buf[pos++] = 0x01;  // CLASS IN
@@ -851,18 +925,19 @@ void handleDNS() {
     buf[pos++] = 0x00; buf[pos++] = 0x04;  // RDLENGTH 4
     buf[pos++] = 192; buf[pos++] = 168;
     buf[pos++] = 4;   buf[pos++] = 1;
+  }
+  // sinon : NOERROR sans réponse (NODATA) — AAAA, HTTPS, etc.
 
-    dnsServer.beginPacket(dnsServer.remoteIP(), dnsServer.remotePort());
-    dnsServer.write(buf, pos);
-    dnsServer.endPacket();
+  dnsServer.beginPacket(dnsServer.remoteIP(), dnsServer.remotePort());
+  dnsServer.write(buf, pos);
+  dnsServer.endPacket();
 
-    // ── V3.4 PORTAL : tracker l'étape DNS ──
-    if (portalStep < PORTAL_DNS) {
-      portalStep = PORTAL_DNS;
-      strncpy(portalDNSHost, hostname, sizeof(portalDNSHost) - 1);
-      portalDNSHost[sizeof(portalDNSHost) - 1] = '\0';
-      if (appState == STATE_PORTAL) drawPortalStep(PORTAL_DNS);
-    }
+  // ── V3.4 PORTAL : tracker l'étape DNS ──
+  if (answerA && portalStep < PORTAL_DNS) {
+    portalStep = PORTAL_DNS;
+    strncpy(portalDNSHost, hostname, sizeof(portalDNSHost) - 1);
+    portalDNSHost[sizeof(portalDNSHost) - 1] = '\0';
+    if (appState == STATE_PORTAL) drawPortalStep(PORTAL_DNS);
   }
 }
 
@@ -877,7 +952,7 @@ void servePage(WiFiClient& client, const char* page) {
   client.println("HTTP/1.1 200 OK");
   client.println("Content-Type: text/html; charset=utf-8");
   client.println("Connection: close");
-  client.printf("Content-Length: %lu\r\n", pageLen);
+  client.printf("Content-Length: %lu\r\n", (unsigned long)pageLen);
   client.println();
 
   const char* ptr = page;
@@ -942,7 +1017,7 @@ void handleHTTP() {
     const char* ok = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
     client.printf("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n"
                   "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
-                  strlen(ok), ok);
+                  (int)strlen(ok), ok);
     client.stop();
     Serial.println("[HTTP] iOS → Success");
     if (portalStep < PORTAL_REDIRECT) {
@@ -958,7 +1033,7 @@ void handleHTTP() {
     const char* ok = "Microsoft Connect Test";
     client.printf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
                   "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
-                  strlen(ok), ok);
+                  (int)strlen(ok), ok);
     client.stop();
     return;
   }
@@ -1208,46 +1283,78 @@ void buildJSON(uint8_t proto, const char* hex,
 BLEServer*         pBLEServer = nullptr;
 BLECharacteristic* pTxChar    = nullptr;
 BLECharacteristic* pRxChar    = nullptr;
-bool     bleConnected   = false;
-uint32_t bleLastActivity = 0;
+volatile bool      bleConnected    = false;
+volatile uint32_t  bleLastActivity = 0;
 
 // ── File d'attente BLE : JSON drones accumulés pendant le scan ──
+//    (accédée uniquement depuis loop())
 char    bleQueue[BLE_QUEUE_SIZE][BLE_MSG_SIZE];
 uint8_t bleQHead = 0;
 uint8_t bleQTail = 0;
 uint8_t bleQCount = 0;
 
 void bleEnqueue(const char* msg) {
-  if (bleQCount >= BLE_QUEUE_SIZE) return;  // plein → drop
-  snprintf(bleQueue[bleQHead], BLE_MSG_SIZE, "%s\n", msg);
+  if (bleQCount >= BLE_QUEUE_SIZE) return;           // plein → drop
+  size_t len = strlen(msg);
+  if (len + 2 > BLE_MSG_SIZE) {                      // ── V3.6 : jamais tronquer ──
+    Serial.printf("[BLE] msg %u o rejete (> %d)\n", (unsigned)len, BLE_MSG_SIZE - 2);
+    return;
+  }
+  memcpy(bleQueue[bleQHead], msg, len);
+  bleQueue[bleQHead][len]     = '\n';
+  bleQueue[bleQHead][len + 1] = '\0';
   bleQHead = (bleQHead + 1) % BLE_QUEUE_SIZE;
   bleQCount++;
 }
 
+// ── V3.6 : taille utile d'une notification = MTU négocié - 3 ──
+uint16_t bleChunkSize() {
+  uint16_t mtu = BLE_MTU_MIN;
+  if (pBLEServer) {
+    uint16_t m = pBLEServer->getPeerMTU(pBLEServer->getConnId());
+    if (m >= BLE_MTU_MIN) mtu = m;
+  }
+  if (mtu > BLE_MTU_LOCAL) mtu = BLE_MTU_LOCAL;
+  return mtu - 3;
+}
+
+// ── V3.6 : envoi en morceaux ≤ MTU-3, la page réassemble sur '\n' ──
 void bleBurst() {
-  if (!bleConnected || bleQCount == 0) return;
-  while (bleQCount > 0) {
-    uint16_t len = strlen(bleQueue[bleQTail]);
-    pTxChar->setValue((uint8_t*)bleQueue[bleQTail], len);
-    pTxChar->notify();
+  if (!bleConnected || !pTxChar || bleQCount == 0) return;
+  uint16_t chunk = bleChunkSize();
+
+  while (bleQCount > 0 && bleConnected) {
+    const char* msg = bleQueue[bleQTail];
+    uint16_t len = strlen(msg);
+    for (uint16_t off = 0; off < len && bleConnected; off += chunk) {
+      uint16_t n = (len - off > chunk) ? chunk : (len - off);
+      pTxChar->setValue((uint8_t*)(msg + off), n);
+      pTxChar->notify();
+      delay(BLE_NOTIFY_GAP_MS);
+    }
     bleQTail = (bleQTail + 1) % BLE_QUEUE_SIZE;
     bleQCount--;
-    delay(3);  // laisser le stack BLE envoyer
   }
   bleLastActivity = millis();
 }
 
-// ── Callback connexion/déconnexion ──
+void bleFlushQueue() {
+  bleQHead = bleQTail = bleQCount = 0;
+}
+
+// ── Callback connexion/déconnexion (tâche BLE : aucun dessin ici) ──
 class BLEServerCB : public BLEServerCallbacks {
   void onConnect(BLEServer* s) override {
-    bleConnected = true;
+    bleConnected    = true;
     bleLastActivity = millis();
     activeTransport = XPORT_BLE;
+    transportDirty  = true;
     Serial.println("[BLE] Client connecte");
-    updateTransportDisplay();
   }
   void onDisconnect(BLEServer* s) override {
-    bleConnected = false;
+    bleConnected    = false;
+    activeTransport = wifiAPActive ? XPORT_WIFI : XPORT_NONE;
+    transportDirty  = true;
     Serial.println("[BLE] Client deconnecte — advertising relance");
     s->startAdvertising();
   }
@@ -1270,7 +1377,7 @@ void startBLE() {
   if (pBLEServer) return;  // déjà actif
 
   BLEDevice::init(BLE_DEVICE_NAME);
-  BLEDevice::setMTU(247);
+  BLEDevice::setMTU(BLE_MTU_LOCAL);
 
   pBLEServer = BLEDevice::createServer();
   pBLEServer->setCallbacks(new BLEServerCB());
@@ -1310,6 +1417,7 @@ void stopBLE() {
     pRxChar = nullptr;
     bleConnected = false;
   }
+  bleFlushQueue();
   Serial.println("[BLE] Arrete");
 }
 
@@ -1334,6 +1442,10 @@ void processBLECommand(const char* cmd) {
       }
     }
   }
+
+  // ── V3.8 : heure téléphone (ms Unix) ──
+  const char* tt = strstr(cmd, "\"t\":");
+  if (tt) setPhoneTime(strtoull(tt + 4, NULL, 10));
 
   const char* sp = strstr(cmd, "\"snd\":");
   if (sp) {
@@ -1640,7 +1752,7 @@ void drawSplash() {
   M5.Display.setTextSize(3);
   M5.Display.setTextColor(TFT_CYAN, C_BG);
   M5.Display.setCursor(20, 50);
-  M5.Display.println("DRONE_RX V3.4");
+  M5.Display.println("DRONE_RX V3.7");
 
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_DARKGREY, C_BG);
@@ -1670,7 +1782,7 @@ void drawScanScreen() {
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(TFT_CYAN, C_BG);
   M5.Display.setCursor(10, 6);
-  M5.Display.println("DRONE RX V3.4");
+  M5.Display.println("DRONE RX V3.7");
 
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_DARKGREY, C_BG);
@@ -1698,7 +1810,7 @@ void drawScanScreen() {
       if (ssid.length() > 22) ssid = ssid.substring(0, 22);
       if (ssid.length() == 0) ssid = "(masque)";
       snprintf(line, sizeof(line), "CH%2d %4ddBm %s",
-               WiFi.channel(i), WiFi.RSSI(i), ssid.c_str());
+               (int)WiFi.channel(i), (int)WiFi.RSSI(i), ssid.c_str());
       uint16_t col = TFT_GREEN;
       if (WiFi.RSSI(i) < -70) col = TFT_YELLOW;
       if (WiFi.RSSI(i) < -85) col = TFT_RED;
@@ -1757,8 +1869,8 @@ void drawPortalScreen() {
 
   M5.Display.fillRect(0, 226, 320, 14, C_HDR);
   M5.Display.setTextColor(TFT_DARKGREY, C_HDR);
-  M5.Display.setCursor(50, 228);
-  M5.Display.println("En attente de client...");
+  M5.Display.setCursor(40, 228);
+  M5.Display.println("Attente client - TOUCHER = passer");
 }
 
 void drawPortalStep(uint8_t step) {
@@ -2058,15 +2170,21 @@ void drawCounters() {
   }
 }
 
+// ── V3.6 : 3 états affichés (BLE connecté / AP WiFi / BLE en attente) ──
 void drawTransportLine() {
   M5.Display.fillRect(0, 42, 320, 14, C_BG);
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_DARKGREY, C_BG);
   M5.Display.setCursor(10, 44);
-  if (activeTransport == XPORT_BLE)
-    M5.Display.println("BLE actif - radio 100% RX");
-  else
+  if (activeTransport == XPORT_BLE) {
+    M5.Display.setTextColor(TFT_CYAN, C_BG);
+    M5.Display.println("BLE connecte");
+  } else if (wifiAPActive) {
+    M5.Display.setTextColor(TFT_DARKGREY, C_BG);
     M5.Display.printf("WiFi:%s http://drone.local", AP_SSID);
+  } else {
+    M5.Display.setTextColor(TFT_YELLOW, C_BG);
+    M5.Display.printf("BLE en attente : %s", BLE_DEVICE_NAME);
+  }
 }
 
 void updateTransportDisplay() {
@@ -2104,7 +2222,8 @@ void drawBottomBar() {
   M5.Display.setTextColor(TFT_WHITE, C_HDR);
 
   char buf[54];
-  const char* xp = (activeTransport == XPORT_BLE) ? "BLE" : "WiFi";
+  const char* xp = (activeTransport == XPORT_BLE) ? "BLE"
+                 : (wifiAPActive ? "WiFi" : "--");
   snprintf(buf, sizeof(buf), "CH:%d Tot:%lu %s [%s] D:%d",
     currentChannel, (unsigned long)totalCount,
     SCAN_MODE_NAMES[scanMode], xp, droneCount);
@@ -2224,7 +2343,9 @@ void startSniffMode() {
   WiFi.disconnect();
   delay(100);
   startBLE();
-  activeTransport = XPORT_BLE;
+  // ── V3.6 : transport = état réel de la liaison BLE ──
+  activeTransport = bleConnected ? XPORT_BLE : XPORT_NONE;
+  bleFlushQueue();
 
   totalCount = 0;
   for (int i = 0; i < NUM_PROTOS; i++) protoCounts[i] = 0;
@@ -2238,14 +2359,15 @@ void startSniffMode() {
 
   enablePromiscuous();
 
-  Serial.printf("\n[RX] Mode %s actif [BLE]\n\n",
-    SCAN_MODE_NAMES[scanMode]);
+  Serial.printf("\n[RX] Mode %s actif [BLE %s]\n\n",
+    SCAN_MODE_NAMES[scanMode], bleConnected ? "connecte" : "en attente");
 
   M5.Speaker.tone(1000, 60); delay(80);
   M5.Speaker.tone(1500, 60); delay(80);
   M5.Speaker.tone(2000, 60); delay(80);
   M5.Speaker.stop();
 
+  transportDirty = false;
   drawSniffScreen();
 }
 
@@ -2461,10 +2583,10 @@ uint16_t buildFRBeacon(uint8_t* buf) {
   // TLV Version (type 1)
   buf[p++] = 0x01; buf[p++] = 0x01; buf[p++] = 0x01;
 
-  // TLV ID exploitant (type 2, len 30)
+  // TLV ID exploitant (type 2, len 30) — ── V3.8 : partie publique seule ──
   buf[p++] = 0x02; buf[p++] = 0x1E;
   memset(buf + p, 0, 30);
-  uint8_t idLen = strlen(telem.id);
+  uint8_t idLen = publicIdLen(telem.id);
   if (idLen > 30) idLen = 30;
   memcpy(buf + p, telem.id, idLen);
   p += 30;
@@ -2485,6 +2607,12 @@ uint16_t buildFRBeacon(uint8_t* buf) {
   buf[p++] = (iAlt >> 8) & 0xFF;
   buf[p++] = iAlt & 0xFF;
 
+  // ── V3.8 : TLV Hauteur / point de décollage (type 7, int16 m) ──
+  int16_t iHgt = (int16_t)(telem.alt - telem.homeAlt);
+  buf[p++] = 0x07; buf[p++] = 0x02;
+  buf[p++] = (iHgt >> 8) & 0xFF;
+  buf[p++] = iHgt & 0xFF;
+
   // TLV Home Lat (type 8)
   int32_t hLat = (int32_t)(telem.homeLat * 1e5);
   buf[p++] = 0x08; buf[p++] = 0x04;
@@ -2498,9 +2626,11 @@ uint16_t buildFRBeacon(uint8_t* buf) {
   // TLV Speed (type 10, val = m/s)
   buf[p++] = 0x0A; buf[p++] = 0x01; buf[p++] = telem.speed;
 
-  // TLV Heading (type 11, val = heading * 256 / 360)
-  buf[p++] = 0x0B; buf[p++] = 0x01;
-  buf[p++] = (uint8_t)(telem.heading * 256 / 360);
+  // ── V3.8 : TLV Route (type 11, uint16 degrés 0–359) ──
+  uint16_t hdg = telem.heading % 360;
+  buf[p++] = 0x0B; buf[p++] = 0x02;
+  buf[p++] = (hdg >> 8) & 0xFF;
+  buf[p++] = hdg & 0xFF;
 
   buf[lenPos] = (uint8_t)(p - lenPos - 1);
   return p;
@@ -2558,6 +2688,7 @@ static void odidEncDir(float deg,uint8_t*dir,uint8_t*ew){int d=(int)roundf(deg);
 static void odidEncSpeedH(float mps,uint8_t*val,uint8_t*mult){if(mps<=255*0.25f){*mult=0;*val=(uint8_t)roundf(mps/0.25f);}else{*mult=1;*val=(uint8_t)roundf((mps-63.75f)/0.75f);}}
 static int8_t odidEncSpeedV(float mps){int v=(int)roundf(mps/0.5f);return(int8_t)(v<-128?-128:(v>127?127:v));}
 static uint8_t odidSendCounter=0;
+#define ODID_EPOCH_2019 1546300800ULL   // 01/01/2019 00:00:00 UTC (s Unix)
 
 uint16_t buildODIDBeacon(uint8_t* buf) {
   uint16_t p = 0;
@@ -2578,7 +2709,9 @@ uint16_t buildODIDBeacon(uint8_t* buf) {
   uint8_t*ps=buf+p;memset(ps,0,packLen);
   ODID_Pack_enc*pk=(ODID_Pack_enc*)ps;
   pk->ProtoVersion=2;pk->MessageType=0xF;pk->SingleMessageSize=25;pk->MsgPackSize=5;
-  uint8_t idLen=strlen(telem.id);if(idLen>20)idLen=20;
+  uint8_t idLen=publicIdLen(telem.id);if(idLen>20)idLen=20;   // ── V3.8 : partie publique ──
+  uint64_t nowMs=nowUnixMs();                                  // ── V3.8 : heure téléphone ──
+  uint64_t nowS=nowMs/1000;
   // Basic ID
   ODID_BasicID_enc*bid=(ODID_BasicID_enc*)pk->Messages[0];
   bid->ProtoVersion=2;bid->MessageType=0;bid->IDType=telem.idType;bid->UAType=telem.uaType;
@@ -2595,7 +2728,7 @@ uint16_t buildODIDBeacon(uint8_t* buf) {
   loc->AltitudeBaro=odidEncAlt(telem.alt);loc->AltitudeGeo=odidEncAlt(telem.alt);
   loc->Height=odidEncAlt(telem.alt-telem.homeAlt);
   loc->HorizAccuracy=10;loc->VertAccuracy=3;loc->BaroAccuracy=2;loc->SpeedAccuracy=3;
-  loc->TSAccuracy=2;loc->TimeStamp=(uint16_t)(((millis()/100)%36000));
+  loc->TSAccuracy=2;loc->TimeStamp=(uint16_t)((nowMs%3600000ULL)/100);   // 1/10 s depuis l'heure
   // Self-ID
   ODID_SelfID_enc*sid=(ODID_SelfID_enc*)pk->Messages[2];
   sid->ProtoVersion=2;sid->MessageType=3;sid->DescType=0;
@@ -2607,7 +2740,7 @@ uint16_t buildODIDBeacon(uint8_t* buf) {
   sys->OperatorLatitude=odidEncLatLon(telem.homeLat);sys->OperatorLongitude=odidEncLatLon(telem.homeLon);
   sys->AreaCount=1;sys->AreaRadius=10;sys->AreaCeiling=odidEncAlt(150.0f);sys->AreaFloor=odidEncAlt(0.0f);
   sys->CategoryEU=telem.euCategory;sys->ClassEU=telem.euClass;
-  sys->OperatorAltitudeGeo=odidEncAlt(telem.homeAlt);sys->Timestamp=millis()/1000;
+  sys->OperatorAltitudeGeo=odidEncAlt(telem.homeAlt);sys->Timestamp=(uint32_t)(nowS>=ODID_EPOCH_2019?nowS-ODID_EPOCH_2019:0);
   // Operator ID
   ODID_OperatorID_enc*oid=(ODID_OperatorID_enc*)pk->Messages[4];
   oid->ProtoVersion=2;oid->MessageType=5;oid->OperatorIdType=0;
@@ -2766,7 +2899,7 @@ void setup() {
 
   Serial.println();
   Serial.println("===========================================");
-  Serial.println(" AH & EPERRET — Drone RX V3.5");
+  Serial.println(" AH & EPERRET — Drone RX V3.7");
   Serial.println(" WiFi AP + BLE / drone.local");
   Serial.println(" Captive Portal + Waterfall SDR");
   Serial.println("===========================================");
@@ -2796,6 +2929,12 @@ void setup() {
 void loop() {
   M5.update();
   checkSerialInput();
+
+  // ── V3.6 : redessin transport demandé par la tâche BLE ──
+  if (transportDirty) {
+    transportDirty = false;
+    updateTransportDisplay();
+  }
 
   // ── Screen timeout : veille après 5 min sans BLE (mode SNIFF uniquement) ──
   if (appState == STATE_SNIFF && !screenAsleep && millis() - bleLastActivity > BLE_IDLE_SLEEP_MS) {
@@ -2871,18 +3010,19 @@ void loop() {
     uint8_t staCount = WiFi.softAPgetStationNum();
     if (staCount > portalLastStaCount && portalStep < PORTAL_CLIENT) {
       portalLastStaCount = staCount;
-      // Attendre 500ms pour laisser le DHCP arriver avec le hostname
-      // Si handleDHCP() l'a déjà mis, on ne touche pas
     }
 
-    // Touch : continuer seulement si page servie
-    if (portalStep >= PORTAL_SERVED) {
-      auto t = M5.Touch.getDetail();
-      if (t.isPressed()) {
-        M5.Speaker.tone(2000, 30); delay(50); M5.Speaker.stop();
-        while (true) { M5.update(); auto r = M5.Touch.getDetail(); if (!r.isPressed()) break; delay(20); }
+    // ── V3.7 : toucher = continuer (QUICK START si page servie, sinon MODES) ──
+    auto t = M5.Touch.getDetail();
+    if (t.isPressed()) {
+      M5.Speaker.tone(2000, 30); delay(50); M5.Speaker.stop();
+      while (true) { M5.update(); auto r = M5.Touch.getDetail(); if (!r.isPressed()) break; delay(20); }
+      if (portalStep >= PORTAL_SERVED) {
         appState = STATE_HELP;
         drawHelpScreen();
+      } else {
+        appState = STATE_MODE_SELECT;   // AP reste actif : connexion possible plus tard
+        drawModeSelect();
       }
     }
     delay(50);

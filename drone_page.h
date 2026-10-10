@@ -1,5 +1,30 @@
 /*
- * drone_page.h — Page HTML V3.5 en PROGMEM
+ * ══════════════════════════════════════════════════════════════
+ *  Nom      : drone_page.h
+ *  Projet   : AH & EPERRET — DRONE RX
+ *  Version  : 3.7
+ *  Date     : 2026-10-10
+ *  Auteur   : E. Perret (eperret@azs.fr)
+ *  Contenu  : Page HTML/CSS/JS servie par drone_rx_v3.ino (PROGMEM)
+ * ══════════════════════════════════════════════════════════════
+ *
+ * V3.7 (2026-10-10) :
+ *   - Heure du téléphone ("t", ms Unix) ajoutée au message position "g"
+ *     envoyé au boîtier toutes les 2 s (horodatage des trames TX)
+ *
+ * V3.6 (2026-10-10) :
+ *   - Décodeur DJI conforme au format DroneID WiFi (OUI 26:37:12) :
+ *     en-tête 3 octets + sous-commande, little-endian,
+ *     lat/lon en radians×1e7 (÷174533), Home aux bons offsets,
+ *     sous-commande 0x11 (n° de série) décodée
+ *   - ODID : table UA Type alignée sur ASTM F3411 (0..15),
+ *     altitude géométrique (baro en repli si géo invalide),
+ *     vitesse verticale décodée
+ *   - FR : route TLV 11 lue sur 2 octets (degrés 0–359)
+ *   - Simu : route FR émise sur 2 octets
+ *   - Drones sans position (trame sans lat/lon) listés et affichés
+ *     dans Info ; champs manquants conservés de la trame précédente
+ *   - TX Config : options Type de drone = valeurs ASTM 0..15
  *
  * V3.5 :
  *   - USB data remplacé par BLE (Web Bluetooth)
@@ -20,11 +45,18 @@
 #define DRONE_PAGE_H
 
 const char PAGE_HTML[] PROGMEM = R"rawpage(<!DOCTYPE html>
+<!--
+  Nom     : DroneRX (page embarquée drone_page.h)
+  Projet  : AH & EPERRET — DRONE RX
+  Version : 3.7
+  Date    : 2026-10-10
+  Auteur  : E. Perret (eperret@azs.fr)
+-->
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no,viewport-fit=cover">
-<title>AH &amp; EPERRET — Drone RX V3.5</title>
+<title>AH &amp; EPERRET — Drone RX V3.7</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Courier New',monospace;background:#0a0e14;color:#c8d0da;height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom);padding-left:env(safe-area-inset-left);padding-right:env(safe-area-inset-right)}
@@ -322,7 +354,7 @@ async function connectBLE(){
       if(!bleDevice||!bleDevice.gatt.connected)return;
       var lat=myLat,lon=myLon;
       if(map){var c=map.getCenter();lat=c.lat;lon=c.lng;}
-      bleSend('{"g":['+lat.toFixed(6)+','+lon.toFixed(6)+','+Math.round(myAlt)+']}');
+      bleSend('{"g":['+lat.toFixed(6)+','+lon.toFixed(6)+','+Math.round(myAlt)+'],"t":'+Date.now()+'}');
     },2000);
   }catch(e){
     setSt('off','BLE: '+e.message);
@@ -402,44 +434,77 @@ function setSt(type,txt){
    DECODEURS — FR / ODID / DJI / PAR
    ═══════════════════════════════════════════════════════════ */
 function parseHex(h){h=h.replace(/[^0-9a-fA-F]/g,'');var b=[];for(var i=0;i<h.length;i+=2)b.push(parseInt(h.substr(i,2),16));return b;}
+// Big-endian (FR)
 function rI32(b,o){return(b[o]<<24)|(b[o+1]<<16)|(b[o+2]<<8)|b[o+3];}
 function rI16(b,o){var v=(b[o]<<8)|b[o+1];if(v>=0x8000)v-=0x10000;return v;}
 function rU16(b,o){return(b[o]<<8)|b[o+1];}
+// Little-endian (ODID, DJI)
+function leI32(b,o){return b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24);}
+function leU16(b,o){return b[o]|(b[o+1]<<8);}
+function leI16(b,o){var v=leU16(b,o);if(v>=0x8000)v-=0x10000;return v;}
+function asciiZ(b,o,n){var s='';for(var i=o;i<o+n&&i<b.length;i++){if(b[i]===0)break;if(b[i]>=32&&b[i]<127)s+=String.fromCharCode(b[i]);}return s;}
 
 function decodeFR(bytes){
   var r={proto:'FR'};var i=0;
   while(i<bytes.length-1){var t=bytes[i++];if(i>=bytes.length)break;var l=bytes[i++];if(i+l>bytes.length)break;var v=bytes.slice(i,i+l);i+=l;
     switch(t){case 1:r.version=v[0];break;case 2:r.idFR=String.fromCharCode.apply(null,v).replace(/\0/g,'');break;case 3:r.idANSI=String.fromCharCode.apply(null,v).replace(/\0/g,'');break;
     case 4:r.lat=rI32(v,0)/1e5;break;case 5:r.lon=rI32(v,0)/1e5;break;case 6:r.altMSL=rI16(v,0);break;case 7:r.altAGL=rI16(v,0);break;
-    case 8:r.homeLat=rI32(v,0)/1e5;break;case 9:r.homeLon=rI32(v,0)/1e5;break;case 10:r.speed=v[0];break;case 11:r.heading=Math.round(v[0]*360/256);break;}}
+    case 8:r.homeLat=rI32(v,0)/1e5;break;case 9:r.homeLon=rI32(v,0)/1e5;break;case 10:r.speed=v[0];break;
+    // ── V3.6 : route sur 2 octets, degrés 0–359 (longueur TLV) ──
+    case 11:r.heading=(l>=2)?rU16(v,0)%360:Math.round(v[0]*360/256);break;}}
   r.id=r.idFR||r.idANSI||'FR-?';r.idType=r.idFR?'France (SGDSN)':(r.idANSI?'ANSI/CTA':'');r.uaType='';return r;}
 
 var ODID_IDT=['Aucun','Serial(ANSI)','Serial(CAA)','UTM(UUID)','Spec'];
-var ODID_UAT=['?','Aeronef','Helico','Gyro','VTOL','CTOL','Fixe','Orni','Planeur','Cerf-v','Aerostat','Dirigeable','Parachute','Fusee','Attache','Sol'];
+// ── V3.6 : UA Type ASTM F3411 (0..15) ──
+var ODID_UAT=['Aucun','Avion','Helico/Multi','Gyro','VTOL','Ornitho','Planeur','Cerf-volant','Ballon libre','Ballon captif','Dirigeable','Parachute','Fusee','Captif motorise','Obstacle sol','Autre'];
 
 function decodeODID(bytes){
   var r={proto:'ODID',id:'ODID-?'};
-  function leI32(b,o){return b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24);}
-  function leU16(b,o){return b[o]|(b[o+1]<<8);}
   var i=4;
   while(i+25<=bytes.length){var mb=bytes[i];var mt=(mb>>4)&0x0F;var msg=bytes.slice(i,i+25);i+=25;
     switch(mt){
     case 0:var it=(msg[1]>>4)&0x0F;var ut=msg[1]&0x0F;var rid=String.fromCharCode.apply(null,msg.slice(2,22)).replace(/\0/g,'');if(rid.length>0)r.id=rid;r.idType=ODID_IDT[it]||('T'+it);r.uaType=ODID_UAT[ut]||('T'+ut);break;
-    case 1:var lat=leI32(msg,5)/1e7;var lon=leI32(msg,9)/1e7;var ag=(leU16(msg,13)*.5)-1000;var ht=(leU16(msg,17)*.5)-1000;
+    case 1:var lat=leI32(msg,5)/1e7;var lon=leI32(msg,9)/1e7;
+      // ── V3.6 : altitude géométrique (off 15), baro (off 13) si géo invalide (0) ──
+      var rawGeo=leU16(msg,15),rawBaro=leU16(msg,13);
+      var ag=((rawGeo!==0?rawGeo:rawBaro)*.5)-1000;var ht=(leU16(msg,17)*.5)-1000;
       var hs=msg[3]*.25;if(msg[1]&1)hs=(msg[3]*0.75)+63.75;var dr=msg[2]+((msg[1]&2)?180:0);
-      if(lat!==0&&lon!==0){r.lat=lat;r.lon=lon;}if(ag>-999)r.altMSL=Math.round(ag);if(ht>-999)r.altAGL=Math.round(ht);r.speed=Math.round(hs*10)/10;r.heading=Math.round(dr)%360;break;
+      if(lat!==0&&lon!==0){r.lat=lat;r.lon=lon;}if(ag>-999)r.altMSL=Math.round(ag);if(ht>-999)r.altAGL=Math.round(ht);r.speed=Math.round(hs*10)/10;r.heading=Math.round(dr)%360;
+      // ── V3.6 : vitesse verticale (int8 × 0,5 m/s, 63 m/s = invalide) ──
+      var vsr=msg[4]>127?msg[4]-256:msg[4];if(vsr!==126)r.vspeed=vsr*0.5;break;
     case 4:var ol=leI32(msg,2)/1e7;var oo=leI32(msg,6)/1e7;if(ol!==0&&oo!==0){r.homeLat=ol;r.homeLon=oo;}break;
     case 5:var oi=String.fromCharCode.apply(null,msg.slice(2,22)).replace(/\0/g,'');if(oi.length>0&&r.id==='ODID-?')r.id=oi;break;
     }}return r;}
 
+/* ── V3.6 : DJI DroneID WiFi (OUI 26:37:12), little-endian ──
+   payload : [0] vendor_type [1] unk1 [2] unk2 [3] sous-commande
+   0x10 flight_reg_info : 4 version, 5 seq(2), 7 state(2), 9 serial(16),
+        25 lon(4), 29 lat(4), 33 alt(2), 35 height(2), 37 vN(2), 39 vE(2),
+        41 vUp(2), 43 pitch, 45 roll, 47 yaw, 49 homeLon(4), 53 homeLat(4)
+        lat/lon : radians × 1e7 → degrés = raw / 174533 ; vitesses cm/s
+   0x11 flight_purpose  : 4 serial(16)                                    */
 function decodeDJI(bytes){
-  var r={proto:'DJI',id:'DJI-?'};if(bytes.length<40){var a='';for(var i=0;i<Math.min(bytes.length,50);i++){if(bytes[i]>=32&&bytes[i]<127)a+=String.fromCharCode(bytes[i]);else if(a.length>=6)break;else a='';}if(a.length>=6)r.id=a;return r;}
-  try{var sn='';for(var i=6;i<22;i++){if(bytes[i]>=32&&bytes[i]<127)sn+=String.fromCharCode(bytes[i]);}if(sn.length>=6)r.id=sn;
-  var lo=rI32(bytes,22)/1e7;var la=rI32(bytes,26)/1e7;if(la!==0&&lo!==0&&Math.abs(la)<90&&Math.abs(lo)<180){r.lat=la;r.lon=lo;}
-  var al=rI16(bytes,30);var ht=rI16(bytes,32);if(al>-500&&al<10000)r.altMSL=al;if(ht>-500&&ht<10000)r.altAGL=ht;
-  var vn=rI16(bytes,34)/100;var ve=rI16(bytes,36)/100;r.speed=Math.round(Math.sqrt(vn*vn+ve*ve)*10)/10;r.heading=Math.round((Math.atan2(ve,vn)*180/Math.PI+360)%360);
-  var hlo=rI32(bytes,40)/1e7;var hla=rI32(bytes,44)/1e7;if(hla!==0&&hlo!==0&&Math.abs(hla)<90){r.homeLat=hla;r.homeLon=hlo;}}catch(e){}
-  r.idType='DJI Serial';r.uaType='DJI';return r;}
+  var r={proto:'DJI',id:'DJI-?',idType:'DJI Serial',uaType:'DJI'};
+  if(bytes.length<4)return r;
+  var sub=bytes[3];
+  if(sub===0x10&&bytes.length>=49){
+    var sn=asciiZ(bytes,9,16);if(sn.length>0)r.id=sn;
+    var lo=leI32(bytes,25)/174533,la=leI32(bytes,29)/174533;
+    if(la!==0&&lo!==0&&Math.abs(la)<90&&Math.abs(lo)<180){r.lat=la;r.lon=lo;}
+    r.altMSL=leI16(bytes,33);r.altAGL=leI16(bytes,35);
+    var vn=leI16(bytes,37)/100,ve=leI16(bytes,39)/100;
+    r.speed=Math.round(Math.sqrt(vn*vn+ve*ve)*10)/10;
+    r.heading=Math.round((Math.atan2(ve,vn)*180/Math.PI+360)%360);
+    r.vspeed=Math.round(leI16(bytes,41))/100;
+    if(bytes.length>=57){
+      var hlo=leI32(bytes,49)/174533,hla=leI32(bytes,53)/174533;
+      if(hla!==0&&hlo!==0&&Math.abs(hla)<90&&Math.abs(hlo)<180){r.homeLat=hla;r.homeLon=hlo;}
+    }
+  }
+  else if(sub===0x11&&bytes.length>=20){
+    var sn2=asciiZ(bytes,4,16);if(sn2.length>0)r.id=sn2;
+  }
+  return r;}
 
 function decodePAR(bytes){var r={proto:'PAR',id:'PAR-?'};var a='';for(var i=0;i<Math.min(bytes.length,60);i++){if(bytes[i]>=32&&bytes[i]<127)a+=String.fromCharCode(bytes[i]);else if(a.length>=6)break;else a='';}if(a.length>=6)r.id=a;r.idType='Parrot';r.uaType='Parrot';return r;}
 
@@ -475,14 +540,14 @@ function updateDisplay(d,m){
   document.getElementById('vID').textContent=d.id||'-';
   document.getElementById('vIDT').textContent=d.idType||'-';
   document.getElementById('vUAT').textContent=d.uaType||'-';
-  document.getElementById('vLat').textContent=d.lat!==undefined?d.lat.toFixed(5)+'\u00B0':'-';
-  document.getElementById('vLon').textContent=d.lon!==undefined?d.lon.toFixed(5)+'\u00B0':'-';
+  document.getElementById('vLat').textContent=d.lat!==undefined?d.lat.toFixed(5)+'°':'-';
+  document.getElementById('vLon').textContent=d.lon!==undefined?d.lon.toFixed(5)+'°':'-';
   document.getElementById('vAlt').textContent=d.altMSL!==undefined?d.altMSL+' m':'-';
   document.getElementById('vAGL').textContent=d.altAGL!==undefined?d.altAGL+' m':'-';
-  document.getElementById('vHLat').textContent=d.homeLat!==undefined?d.homeLat.toFixed(5)+'\u00B0':'-';
-  document.getElementById('vHLon').textContent=d.homeLon!==undefined?d.homeLon.toFixed(5)+'\u00B0':'-';
+  document.getElementById('vHLat').textContent=d.homeLat!==undefined?d.homeLat.toFixed(5)+'°':'-';
+  document.getElementById('vHLon').textContent=d.homeLon!==undefined?d.homeLon.toFixed(5)+'°':'-';
   document.getElementById('vSpd').textContent=d.speed!==undefined?d.speed+' m/s':'-';
-  document.getElementById('vHdg').textContent=d.heading!==undefined?d.heading+'\u00B0':'-';
+  document.getElementById('vHdg').textContent=d.heading!==undefined?d.heading+'°':'-';
   document.getElementById('vVs').textContent=d.vspeed!==undefined?d.vspeed+' m/s':'-';
   document.getElementById('vHex').textContent=m.hex||'-';
 }
@@ -628,21 +693,24 @@ function updatePrediction(id){
 }
 
 function updateMap(d,m){
-  if(d.lat===undefined||d.lon===undefined)return;
   var id=d.id||'?';
+  // ── V3.6 : la trame courante porte-t-elle une position ? ──
+  var hasPos=(d.lat!==undefined&&d.lon!==undefined);
   var dr=drones[id];
   if(!dr){
     var c=COLORS[colorIdx%COLORS.length];colorIdx++;
-    dr={color:c,proto:d.proto,marker:null,home:null,trail:null,altLbl:null,predLine:null,predPoly:null,prevPredPts:null,history:[],data:d,meta:m,lastSeen:Date.now()};
+    dr={color:c,proto:d.proto,marker:null,home:null,trail:null,altLbl:null,predLine:null,predPoly:null,prevPredPts:null,history:[],data:null,meta:m,lastSeen:Date.now()};
     if(mapReady)dr.trail=L.polyline([],{color:c,weight:2,opacity:.7,dashArray:'4 4'}).addTo(map);
     drones[id]=dr;updateDroneList();
     // ── V3.3 : auto-detect myself (position statique proche de Moi) ──
-    if(!myselfId&&d.lat!==undefined&&d.lon!==undefined&&(d.speed===undefined||d.speed<=1)){
+    if(!myselfId&&hasPos&&(d.speed===undefined||d.speed<=1)){
       if(distDeg(d.lat,d.lon,myLat,myLon)<MYSELF_TOL){myselfId=id;updateDroneList();}
     }
   }
+  // ── V3.6 : champs absents de la trame repris de la précédente (ex. DJI 0x11) ──
+  if(dr.data){var mg={},k;for(k in dr.data)mg[k]=dr.data[k];for(k in d)if(d[k]!==undefined)mg[k]=d[k];d=mg;}
   dr.data=d;dr.meta=m;dr.proto=d.proto;dr.lastSeen=Date.now();
-  if(mapReady){
+  if(mapReady&&hasPos){
     var ll=[d.lat,d.lon];
     if(!dr.marker)dr.marker=L.marker(ll,{icon:id===myselfId?makeMyselfIcon():makeDroneIcon(dr.color)}).addTo(map);
     else{dr.marker.setLatLng(ll);dr.marker.setIcon(id===myselfId?makeMyselfIcon():makeDroneIcon(dr.color));}
@@ -684,8 +752,8 @@ function updateDroneList(){
     div.innerHTML='<span class="dc" style="background:'+(isMe?'#ff0':d.color)+'"></span>'+si+'<span class="dp" style="color:'+d.color+';border:1px solid '+d.color+'">'+d.proto+'</span>'+(isMe?'<span class="my-tag">MY</span>':'');
     div.onclick=function(){
       if(!myselfId){myselfId=id;}
-      selId=id;updateDroneList();updateDisplay(d.data,d.meta);
-      if(mapReady&&d.data.lat)map.panTo([d.data.lat,d.data.lon]);
+      selId=id;updateDroneList();if(d.data)updateDisplay(d.data,d.meta);
+      if(mapReady&&d.data&&d.data.lat!==undefined)map.panTo([d.data.lat,d.data.lon]);
     };
     c.appendChild(div);
   });
@@ -854,7 +922,8 @@ function buildFR(lat,lon,alt,spd,hdg,hLat,hLon,id){
   var b=[];b.push(1,1,1);var ib=[];for(var i=0;i<30;i++)ib.push(i<id.length?id.charCodeAt(i):0);b.push(2,30);b=b.concat(ib);
   b.push(4,4);b=b.concat(encI32(lat*1e5));b.push(5,4);b=b.concat(encI32(lon*1e5));b.push(6,2);b=b.concat(encI16(alt));
   b.push(8,4);b=b.concat(encI32(hLat*1e5));b.push(9,4);b=b.concat(encI32(hLon*1e5));
-  b.push(10,1,spd&0xFF);b.push(11,1,Math.round(hdg*256/360)&0xFF);
+  // ── V3.6 : route sur 2 octets (degrés) ──
+  b.push(10,1,spd&0xFF);b.push(11,2);b=b.concat(encI16(Math.round(hdg)%360));
   return b.map(function(x){return x.toString(16).padStart(2,'0');}).join('');}
 
 function startSim(){
@@ -1120,13 +1189,17 @@ function saveTxConfig(){
     <option value="2">Helicoptere / Multirotor</option>
     <option value="3">Gyravion</option>
     <option value="4">VTOL (hybride)</option>
-    <option value="5">CTOL (decollage court)</option>
-    <option value="7">Ornithoptere</option>
-    <option value="8">Planeur</option>
-    <option value="10">Aerostat (ballon)</option>
-    <option value="11">Dirigeable</option>
-    <option value="12">Parachute</option>
-    <option value="14">Sol (rover)</option>
+    <option value="5">Ornithoptere</option>
+    <option value="6">Planeur</option>
+    <option value="7">Cerf-volant</option>
+    <option value="8">Ballon libre</option>
+    <option value="9">Ballon captif</option>
+    <option value="10">Dirigeable</option>
+    <option value="11">Parachute / chute libre</option>
+    <option value="12">Fusee</option>
+    <option value="13">Aeronef captif motorise</option>
+    <option value="14">Obstacle au sol</option>
+    <option value="15">Autre</option>
   </select>
   <label>Type d'identification</label>
   <select id="txIdType">
