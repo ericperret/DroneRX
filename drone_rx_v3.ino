@@ -1752,7 +1752,7 @@ void drawSplash() {
   M5.Display.setTextSize(3);
   M5.Display.setTextColor(TFT_CYAN, C_BG);
   M5.Display.setCursor(20, 50);
-  M5.Display.println("DRONE_RX V3.7");
+  M5.Display.println("DRONE_RX V3.8");
 
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_DARKGREY, C_BG);
@@ -1782,7 +1782,7 @@ void drawScanScreen() {
   M5.Display.setTextSize(2);
   M5.Display.setTextColor(TFT_CYAN, C_BG);
   M5.Display.setCursor(10, 6);
-  M5.Display.println("DRONE RX V3.7");
+  M5.Display.println("DRONE RX V3.8");
 
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(TFT_DARKGREY, C_BG);
@@ -2899,7 +2899,7 @@ void setup() {
 
   Serial.println();
   Serial.println("===========================================");
-  Serial.println(" AH & EPERRET — Drone RX V3.7");
+  Serial.println(" AH & EPERRET — Drone RX V3.8");
   Serial.println(" WiFi AP + BLE / drone.local");
   Serial.println(" Captive Portal + Waterfall SDR");
   Serial.println("===========================================");
