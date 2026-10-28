@@ -1,0 +1,43 @@
+# ==============================================================================
+#  Nom / Name : CITATION.cff
+#  Projet     : DroneRX — https://github.com/ericperret/DroneRX
+#  Auteur     : Eric PERRET
+#  Date       : 2026-10-27
+#  Version    : 1.0
+#  Objet      : métadonnées de citation (bouton « Cite this repository » de GitHub)
+#  Licence    : CC BY-NC 4.0 — usage commercial sur autorisation écrite (eperret@azs.fr)
+# ==============================================================================
+cff-version: 1.2.0
+message: "If you use or cite this work, please credit it as below. / Merci de citer ce travail comme ci-dessous."
+type: software
+title: "DroneRX — passive drone detection and identification"
+abstract: "Passive drone detection and Remote ID on M5Stack CoreS3 (ESP32-S3): FR SGDSN, ASTM F3411 OpenDroneID, DJI and Parrot beacons, ADS-B overlay, trajectory prediction, offline web map."
+authors:
+  - family-names: "PERRET"
+    given-names: "Eric"
+    email: "eperret@azs.fr"
+repository-code: "https://github.com/ericperret/DroneRX"
+url: "https://github.com/ericperret/DroneRX"
+license: CC-BY-NC-4.0
+date-released: "2026-10-27"
+keywords:
+  - drone
+  - drone-detection
+  - remote-id
+  - opendroneid
+  - astm-f3411
+  - counter-uas
+  - wifi-sniffer
+  - beacon
+  - ads-b
+  - opensky
+  - anticollision
+  - trajectory-prediction
+  - leaflet
+  - esp32
+  - esp32-s3
+  - m5stack
+  - arduino
+  - cpp
+  - embedded-systems
+  - french-guiana
